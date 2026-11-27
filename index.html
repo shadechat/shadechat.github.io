@@ -650,7 +650,7 @@ function openExport(){
 function logout(){ loggedIn = false; store.del("pling-session"); overlay.replaceChildren(); showAuth("login"); }
 
 // ================= Personen & Inhalte (Beispiele) =================
-const SHADE_VERSION = "17.11. 14:54";
+const SHADE_VERSION = "27.11. 16:33";
 const ME = "me";
 const people = {
   street: {name:"Streetfood Stuttgart", username:"streetfood.stgt", color:"#c2562b", bio:"Die besten Spots der Stadt. Jeden Abend neu.", followers:48200, verified:true},
@@ -3096,7 +3096,7 @@ const P2P = (() => {
   const NT = "https://ntfy.sh/";
   const rnd = () => Array.from(crypto.getRandomValues(new Uint8Array(10)), b => "abcdefghijkmnpqrstuvwxyz23456789"[b % 32]).join("");
   let st = {}; try { st = JSON.parse(store.get("shade-p2p") || "{}") || {}; } catch { st = {}; }
-  st.code = st.code || rnd(); st.friends = st.friends || {}; st.msgs = st.msgs || {}; st.seen = st.seen || [];
+  st.code = st.code || rnd(); st.friends = st.friends || {}; st.msgs = st.msgs || {}; st.seen = st.seen || []; st.pend = st.pend || {};
   st.since = st.since || Math.floor(Date.now() / 1000) - 43200;
   const save = () => { try { store.set("shade-p2p", JSON.stringify(st)); } catch {} };
   save();
@@ -3141,11 +3141,12 @@ const P2P = (() => {
     if (!p || typeof p.from !== "string" || !/^[a-z0-9]{6,20}$/.test(p.from) || p.from === st.code) return;
     if (p.t === "req"){
       if (!account || p.to !== account.username || st.friends[p.from]) return;
-      addFriend(p.from, p.name, p.username);
+      addFriend(p.from, p.name, p.username); if (p.username && st.pend[p.username]){ delete st.pend[p.username]; save(); }
       post(p.from, {t:"hi", ...meInfo()}, "hat deine Freundschaftsanfrage angenommen 👋").catch(()=>{});
       toast(`${p.name || "Jemand"} ist jetzt dein Freund`); renderAll(); return;
     }
     if (p.t === "hi" || p.t === "ack"){
+      if (p.username && st.pend[p.username]){ delete st.pend[p.username]; save(); }
       const isNew = addFriend(p.from, p.name, p.username);
       if (p.t === "hi"){ post(p.from, {t:"ack", ...meInfo()}).catch(()=>{}); if (isNew) toast(`${p.name || "Jemand"} hat dich als Freund hinzugefügt`); }
       renderAll(); return;
@@ -3197,7 +3198,7 @@ const P2P = (() => {
   function announce(force){
     if (!account || !account.username) return;
     const last = +store.get("shade-announce") || 0, key = account.username + "|" + (account.name || "");
-    if (!force && Date.now() - last < 3 * 3600e3 && store.get("shade-announce-key") === key) return;
+    if (!force && Date.now() - last < 2 * 3600e3 && store.get("shade-announce-key") === key) return;
     fetch(NT, {method:"POST", body:JSON.stringify({topic:uT(account.username), message:JSON.stringify({code:st.code, name:account.name || "", username:account.username, at:Date.now()})})})
       .then(r => { if (r.ok){ store.set("shade-announce", Date.now()); store.set("shade-announce-key", key); } }).catch(()=>{});
   }
@@ -3211,11 +3212,43 @@ const P2P = (() => {
     return Object.values(found).filter(f => f.code !== st.code);
   }
   setTimeout(() => announce(false), 2500); setInterval(() => announce(false), 30 * 60e3);
+  // Offene Anfragen: immer wieder suchen und neu senden, bis der Freund ShadeChat öffnet (ntfy merkt sich nur 12 Std.)
+  const sendReq = u => fetch(NT, {method:"POST", body:JSON.stringify({topic:rT(u), message:JSON.stringify({t:"req", to:u, ...meInfo(), at:Date.now()})})}).then(r => { if (!r.ok) throw 0; });
+  async function retryPending(){
+    if (!account || !account.username) return;
+    for (const [u, info] of Object.entries(st.pend)){
+      if (Date.now() - info.at > 21 * 864e5){ delete st.pend[u]; save(); continue; }
+      const list = await lookup(u).catch(() => []);
+      if (list.length){
+        const f = list.sort((a, b) => b.at - a.at)[0];
+        if (st.friends[f.code]){ delete st.pend[u]; save(); continue; }
+        try { await post(f.code, {t:"hi", ...meInfo()}, "hat dich als Freund hinzugefügt 👋"); addFriend(f.code, f.name, u); delete st.pend[u]; save(); renderAll(); toast(f.name + " ist jetzt dein Freund"); } catch {}
+        continue;
+      }
+      if (Date.now() - (info.sent || 0) > 4 * 3600e3){ try { await sendReq(u); info.sent = Date.now(); save(); } catch {} }
+    }
+  }
+  setTimeout(retryPending, 6000); setInterval(retryPending, 15 * 60e3);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") setTimeout(retryPending, 1500); });
+  // Einladungs-Link: shadechat.github.io/#add=… – wer ihn öffnet, ist sofort befreundet
+  const inviteLink = () => location.origin + location.pathname + "#add=" + b64u(JSON.stringify({c:st.code, n:account?.name || "", u:account?.username || ""}));
+  { const m = location.hash.match(/#add=([A-Za-z0-9_-]+)/); if (m){ store.set("shade-invite", m[1]); history.replaceState(null, "", location.pathname); } }
+  async function useInvite(){
+    const raw = store.get("shade-invite"); if (!raw || !account || !account.username) return;
+    let inv = null; try { inv = JSON.parse(unb64u(raw)); } catch {}
+    if (!inv || !/^[a-z0-9]{6,20}$/.test(inv.c || "") || inv.c === st.code){ store.set("shade-invite", ""); return; }
+    if (st.friends[inv.c]){ store.set("shade-invite", ""); return; }
+    try { await post(inv.c, {t:"hi", ...meInfo()}, "hat dich als Freund hinzugefügt 👋"); addFriend(inv.c, inv.n, inv.u); store.set("shade-invite", ""); renderAll(); toast((inv.n || "Freund") + " ist jetzt dein Freund"); } catch {}
+  }
+  setInterval(useInvite, 2000);
+  const shareInvite = async () => { const url = inviteLink(), text = "Add mich bei ShadeChat 👻";
+    try { if (navigator.share){ await navigator.share({title:"ShadeChat", text, url}); return; } } catch (e){ if (e && e.name === "AbortError") return; }
+    try { await navigator.clipboard.writeText(text + " " + url); toast("Link kopiert – schick ihn deinem Freund"); } catch { prompt("Diesen Link deinem Freund schicken:", url); } };
   let lastUser = null; setInterval(() => { const u = account && account.username; if (u && u !== lastUser){ lastUser = u; listen(); } }, 2000);
   // Freunde hinzufügen per Benutzername oder Code
   openAddFriend = function(){
     const input = h("input",{class:"search",id:"friend-input",style:"padding-left:14px",placeholder:"Benutzername",autocapitalize:"none",autocorrect:"off",onkeydown:e=>{ if (e.key === "Enter") go(); }});
-    const msg = h("p",{class:"note",style:"text-align:left"},"Benutzername");
+    const msg = h("p",{class:"note",style:"text-align:left;min-height:1em"},"");
     const results = h("div",{style:"display:grid;gap:8px"});
     const addCode = async (code, name) => {
       if (code === st.code) return msg.textContent = "Das bist du selbst.";
@@ -3243,10 +3276,10 @@ const P2P = (() => {
       if (/^[a-z0-9]{10}$/.test(code)) return addCode(code);
       if (/^[a-z0-9._]{3,20}$/.test(u)){
         try {
-          const r = await fetch(NT, {method:"POST", body:JSON.stringify({topic:rT(u), message:JSON.stringify({t:"req", to:u, ...meInfo(), at:Date.now()})})});
-          if (!r.ok) throw 0;
+          await sendReq(u);
+          st.pend[u] = {at:Date.now(), sent:Date.now()}; save();
           closeOverlay(); goTab(0); toast("Anfrage an @" + u + " gesendet – sobald er ShadeChat öffnet, seid ihr Freunde.");
-        } catch { msg.textContent = "Ging gerade nicht – prüf dein Internet und versuch es nochmal."; }
+        } catch { st.pend[u] = {at:Date.now(), sent:0}; save(); closeOverlay(); goTab(0); toast("Anfrage an @" + u + " wird gesendet, sobald es klappt."); }
         return;
       }
       msg.textContent = "Bitte gib einen Benutzernamen ein.";
@@ -3256,6 +3289,8 @@ const P2P = (() => {
       h("div",{class:"sheet"}, h("h2",{},"Freunde hinzufügen", iconBtn("close","Schließen",closeOverlay)),
         h("h2",{style:"margin-top:8px"},"Freund suchen"), input, msg, results,
         h("button",{class:"send",style:"width:100%",onclick:go}, ic("userplus"),"Hinzufügen"),
+        h("h2",{style:"margin-top:14px"},"Mich adden lassen"),
+        h("button",{class:"sbtn",style:"width:100%;justify-content:center",onclick:shareInvite}, ic("share"),"Meinen Link schicken"),
         )));
     input.focus();
   };
